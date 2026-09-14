@@ -78,10 +78,11 @@ only contains `tas`.
   extent per chunk, ~108 MB decompressed per chunk as float32), with one shorter final chunk.
   This matches the "chunks along time" case `xr.open_zarr(path, chunks={})` was written for;
   no rechunking needed.
-- Units: `tas` is in K, matching the assumed `PHYSICAL_LIMITS`. Confirmed by the run: observed
-  range was 183.16-317.25 K, comfortably inside `(180, 340)`, with `range_n_out = 0`.
-- Calendar: `noleap`, decoded by xarray into a `CFTimeIndex`. `check_spatial_pattern`'s use of
-  `da.indexes["time"]` and `.shift(time=-1)` both work unmodified against it.
+- Units: `tas` is in K, matching the assumed `PHYSICAL_LIMITS`. The store's raw observed range
+  is 183.16-317.25 K; the low end turned out to be a repeated sentinel/fill-value artifact, not
+  real data -- see the `PHYSICAL_LIMITS` comment in `checks.py`, §4, and §11.
+- Calendar: `noleap`, decoded by xarray into a `CFTimeIndex`. `da.indexes["time"]` works
+  unmodified against it (used by `check_repeated_extreme`'s flagged-date formatting).
 - Zarr format: v3, with inline consolidated metadata. zarr-python 3.3.0 reads it; xarray emits
   a benign `ZarrUserWarning` that consolidated metadata isn't yet part of the v3 spec.
 - Fill value: `NaN`, for `tas`/`lat`/`lon`/`crs` alike, confirming NaN is the missing-data
@@ -118,12 +119,11 @@ variable × model × scenario, and every check runs on every store.
 
 - Over all non-NaN values, report `range_min`, `range_max`, `range_n_out`, and
   `range_pct_out` against a per-variable `(low, high)` limit.
-- Limits live in `PHYSICAL_LIMITS` in `checks.py`. The user accepted these values "for now".
-  Recheck the units once the sample store arrives.
+- Limits live in `PHYSICAL_LIMITS` in `checks.py`.
 
 | Variable | Assumed units | low | high |
 |---|---|---|---|
-| tas, tasmax, tasmin | K | 180 | 340 |
+| tas, tasmax, tasmin | K | 250 | 325 |
 | pr | kg m-2 s-1 | 0 | 0.03 |
 | hurs | % | 0 | 100 |
 | huss | kg kg-1 | 0 | 0.1 |
@@ -131,27 +131,62 @@ variable × model × scenario, and every check runs on every store.
 | rlds | W m-2 | 0 | 700 |
 | sfcWind | m s-1 | 0 | 50 |
 
+- `tas`/`tasmax`/`tasmin` updated (2026-09-14) from a global `(180, 340)` placeholder to a
+  region-derived bound: a field-wide per-day min/max scan of the real `tas` sample store found
+  the genuine climatological extremes are `258.01-317.25 K` (a plausible once-in-decades
+  January cold snap up to a late-century SSP5-8.5 heatwave), padded ~8 K each direction in
+  `checks.py` for tasmax/tasmin's larger swing and for models/scenarios not yet sampled. Only
+  `tas` has a real sample store; `pr`/`hurs`/etc. are still unconfirmed placeholders.
+- That same scan surfaced something worth a closer look on its own: 37 days share an *exact*
+  repeated field-wide-min value (`183.1576 K` on 15 days, `185.0881 K` on 22 days), scattered
+  across random months including summer -- physically impossible for real cold extremes, and a
+  strong signature of a fixed sentinel/fill value leaking into the array instead of being
+  masked as NaN. The new bound excludes them from "physically plausible" by construction, but
+  the check doesn't identify *why* they're wrong -- it would just report them as `range_n_out`.
+
 - **Temperature only:** also check `tasmin <= tas <= tasmax` in every cell on every day. This
   runs once per model/scenario from the `tas` store, and its results go in the `tas` row:
   `range_n_tasmin_gt_tas`, `range_n_tas_gt_tasmax`, `range_n_tasmin_gt_tasmax`. It is skipped
   (columns left empty) if `tasmin` or `tasmax` is missing. The three grids must match exactly,
   otherwise the `tas` store gets `failed`.
 
-### Check 4: Spatial pattern (`checks.check_spatial_pattern`)
+### Check 4: Spatial artifacts (`checks.check_spatial_banding`, `checks.check_spatial_roughness`, `checks.check_repeated_extreme`)
 
-The goal is to catch days whose spatial field does not look like the fields next to them
-(for example shifted, flipped, scrambled, or from the wrong day).
+The goal is to catch downscaling artifacts within a single day's field -- e.g. bands/seams
+from a tile boundary, or localized corruption in a small patch of cells -- that look like
+processing defects rather than a smooth climatological pattern.
 
-- Normalize each day's field over space: `z_t = (x_t - mean_t) / std_t`, ignoring NaNs.
-- Compute the spatial pattern correlation between consecutive days:
-  `r[t] = mean_space(z_t * z_{t+1})`, saved as `spatial_r`.
-- A correlation is "low" if `r < median(r) - K * MAD(r)` (`SPATIAL_MAD_K = 5`, using the
-  store's own series). Day `t` is **flagged** only if both `r[t-1]` and `r[t]` are low, meaning
-  the day correlates poorly with both neighbours. One low value alone is usually a real
-  weather change. The first and last days can never be flagged.
-- A day with zero spatial variance (for example no rain anywhere) gives `r = NaN` and is never
-  flagged.
-- Report `spatial_n_flagged`, and `spatial_flagged_dates` (JSON only).
+An earlier version of this check compared each day's spatial pattern to its neighbours
+(correlation-based). Retired 2026-09-14: it missed persistent, single-day structural defects
+(e.g. a clean diagonal seam) whenever the affected area was too smooth or too small a fraction
+of the domain to move the whole-field correlation enough to cross its threshold -- confirmed
+against a real seam artifact in the sample store that it never flagged. The three checks below
+look within one day instead of across days, so they don't share that blind spot, and they're
+cheaper (no cross-chunk `.shift` between time chunks).
+
+- **Banding** (`check_spatial_banding`): each day's row-mean and column-mean profile, then the
+  discrete second difference (Laplacian) along each profile. Flagged if the worst row or
+  column spikes above `median + BANDING_MAD_K * MAD` of the store's own per-day score
+  (`BANDING_MAD_K = 8`). Catches straight seams/tile-boundary artifacts.
+- **Roughness** (`check_spatial_roughness`): each day's residual from a separable
+  `ROUGHNESS_WINDOW = 9`-cell boxcar smooth over space, reduced to its spatial std. Flagged
+  above `median + ROUGHNESS_MAD_K * MAD` (`ROUGHNESS_MAD_K = 15`). Catches corruption localized
+  to a small patch of cells that barely moves the whole-field mean or correlation.
+- **Repeated extreme** (`check_repeated_extreme`): each day's field-wide min and max. Flagged
+  if either value exactly matches at least `REPEATED_VALUE_MIN_REPEATS = 5` other days in the
+  series -- real weather essentially never reproduces a spatial extreme to full float
+  precision, so a repeated exact value is the signature of a fixed sentinel/fill value leaking
+  into the array instead of being masked as NaN (see the `PHYSICAL_LIMITS` comment in
+  `checks.py`, and §11). This is the one built specifically for that failure mode; a first
+  attempt using the daily spatial *mean* instead of min/max caught only 4 of 37 known cases --
+  the corrupted patch is usually too small a fraction of the ~270k-cell domain to move the mean
+  enough to reproduce exactly, so it isn't a reliable signal here.
+- All three report `<name>_n_flagged` and `<name>_flagged_dates` (JSON only); the per-day score
+  series (`banding_score`, `roughness_score`, `repeated_daily_min`, `repeated_daily_max`) go in
+  the per-store `.nc`.
+- Thresholds (the three `*_MAD_K` constants and `REPEATED_VALUE_MIN_REPEATS`) were calibrated
+  against the real `tas` sample store, not derived analytically -- revisit once more real
+  stores (other variables/models) are available.
 
 ### Adding a new check
 
@@ -165,19 +200,24 @@ def check_name(da: xr.DataArray, variable: str) -> dict:
 ```
 
 - Values must be lazy: xarray objects, or `dask.delayed` for small post-processing on a
-  reduced 1-D series (see `_mode_deviation`, `_flag_days`). `run.check_store` computes the
+  reduced 1-D series (see `_mode_deviation`, `_flag_high`). `run.check_store` computes the
   values of all checks together in one call, so the store is read once (§6).
 - Prefix keys with the check name. 1-D results over `time` go in the per-store `.nc`, and
   everything else goes in the JSON and `summary.csv`.
 - Add the check to `CHECKS` in `run.py`, and add a clean case and a fault case to
-  `tests/test_checks.py`.
+  `tests/test_checks.py`. Also add a `tests/test_checks_unit.py` case that hand-derives the
+  expected number on a small input and asserts the check produces exactly that value --
+  `test_checks.py` only proves a fault gets *flagged*, not that the underlying number is
+  right.
 
 ## 5. Outputs (committed to git)
 
 ```
 results/
   stores/<model>_<scenario>_<variable>.json   # status, error, scalar results; one per store
-  stores/<model>_<scenario>_<variable>.nc     # time series: nan_count, spatial_r (status ok only)
+  stores/<model>_<scenario>_<variable>.nc     # time series (status ok only): nan_count,
+                                               #   banding_score, roughness_score,
+                                               #   repeated_daily_min, repeated_daily_max
   summary.csv                                  # one row per JSON (list fields dropped)
 ```
 
@@ -185,8 +225,12 @@ results/
   restart, stores that already have a JSON are skipped. Use `--overwrite` to redo them. A
   crash at store 300 does not force a re-read of 20 TB.
 - `summary.csv` is rebuilt from all the JSONs at the end of every run.
-- Size estimate: `spatial_r` is float64 and ~31k days long, so roughly 100 MB of `.nc` for
-  the whole run. If that is too big for git, store it as float32.
+- Size estimate: 5 time series per store now instead of 2 (`nan_count` plus 4 from check 4, all
+  float32 except `nan_count`). Measured on the real `tas` sample store: ~560 KB per store, so
+  roughly 250 MB across all real (non-`missing`) stores if most of the catalog turns out to
+  exist -- similar order to the ~100 MB estimate under the old check 4. If that's too big for
+  git once the real catalog size is known, drop the two `*_score` series to a coarser dtype or
+  keep only the scalar `*_n_flagged` counts in the `.nc`.
 
 ## 6. Performance rules
 
@@ -202,8 +246,19 @@ results/
 - Cluster: `dask.distributed.LocalCluster` with `--n-workers` (default 42) and
   `--threads-per-worker` (default 4). Tune after profiling the sample. Numcodecs decompression
   and numpy reductions release the GIL, so several threads per worker is fine.
-- Check 4 casts to float64 (avoiding float32 precision loss over ~10⁸ cells), and its `shift`
-  along time adds cross-chunk tasks. Only optimize this if profiling shows it dominates.
+- Check 4's three checks are all per-day only (no cross-time `.shift`), so unlike the retired
+  correlation check they add no cross-chunk tasks -- each is embarrassingly parallel across
+  chunks along time, same as checks 2-3.
+- **xarray's dask-backed `.rolling(..., min_periods=1)` can explode into millions of graph
+  tasks** rather than one task per chunk, even when the rolled dims aren't themselves chunked.
+  `check_spatial_roughness`'s first version used two chained `.rolling().mean()` calls for a
+  separable boxcar smooth; on the real `tas` sample store that alone produced ~2.2M tasks
+  (vs. 1.4k-57k for every other check) and OOM-killed the run even at `--n-workers 1`. Fixed by
+  replacing it with `scipy.ndimage.uniform_filter` (NaN-aware, via `xr.apply_ufunc(...,
+  dask="parallelized")`) -- one task per chunk, ~10k tasks total. If a future check needs
+  windowed/rolling behavior over space, measure its graph size (`len(dask.delayed(v)
+  .__dask_graph__())` per lazy result, before calling `.compute()`) rather than assuming
+  xarray's rolling stays cheap just because the window dim isn't chunked.
 - Known extra cost: the temperature order check re-reads `tasmin` and `tasmax` (~2/9 extra
   I/O). It is marked `# ponytail:` in `run.py`.
 
@@ -215,10 +270,12 @@ needed. `qc/` is a namespace package (no `__init__.py`).
 ```
 qc/
   catalog.py        # VARIABLES, MODELS, SCENARIOS, YEARS, store_path()
-  checks.py         # PHYSICAL_LIMITS, SPATIAL_MAD_K, one function per check (2, 3, 4)
+  checks.py         # PHYSICAL_LIMITS, BANDING_MAD_K, ROUGHNESS_MAD_K, REPEATED_VALUE_MIN_REPEATS,
+                    #   one function per check (2, 3, 4)
   run.py            # CLI: cluster, loop stores, check 1 + CHECKS, write results, summary.csv
 tests/
-  test_checks.py    # synthetic small stores with injected faults
+  test_checks.py       # synthetic small zarr stores + injected faults, via check_store end to end
+  test_checks_unit.py  # checks.py functions called directly on hand-computable in-memory arrays
 docs/llm/README.md  # this file
 Dockerfile
 requirements.txt    # direct dependencies, pinned
@@ -236,10 +293,19 @@ The filter flags let you run one variable or one store during development.
 
 ## 8. Testing
 
-- Run `pytest` in the container. The tests use small **synthetic** stores (50 days × 20 × 20,
-  chunked 10 days) written to `tmp_path`. They must never touch `/local1`.
-- Each check has a clean case and an injected-fault case: missing path, garbage store,
-  one extra NaN, one out-of-range value, one `tasmin > tas` cell, and one scrambled day.
+- Run `pytest` in the container. Two files, two different jobs:
+  - `test_checks.py` -- small **synthetic** zarr stores (50 days × 20 × 20, chunked 10 days)
+    written to `tmp_path`, run through the full `check_store` pipeline. Each check has a clean
+    case and an injected-fault case: missing path, garbage store, one extra NaN, one
+    out-of-range value, one `tasmin > tas` cell, a seam, a localized corrupt patch, a repeated
+    extreme value. This proves faults get **flagged**; it does not prove the numbers are right
+    (e.g. a check could flag the correct day while reporting a wrong `n_out`, or a MAD
+    computed with the wrong `k`, and these tests wouldn't catch it).
+  - `test_checks_unit.py` -- `checks.py` functions and their private helpers called directly
+    on small in-memory arrays, no zarr I/O. Each expected value is derived by hand in the
+    test's own comment, independent of the implementation, so it actually verifies
+    **correctness**, not just detection.
+  - Neither touches `/local1`.
 
 ```bash
 docker build -t setx-qc:latest .
@@ -275,11 +341,21 @@ at the expected `<root>/tas/...` path; the other 449 combinations correctly repo
 - After the sample store arrives, run `python -m qc.run` against it and record the wall time
   and peak memory in this file.
 
+**Update, same day:** the correlation check (`check_spatial_pattern`) referenced above was
+retired later this session -- see Check 4 above for why and what replaced it. The `183.16 K`
+value this run reported as merely "inside the `180-340 K` limit" was later identified as a
+repeated sentinel/fill-value artifact, not a benign edge value; `PHYSICAL_LIMITS` was tightened
+in response (see §4) and `check_repeated_extreme` now exists specifically to catch it. The
+804-flagged-day figure from the old check is superseded; it isn't necessarily comparable to
+what the three new checks flag.
+
 ## 9. Dependencies and container
 
 `requirements.txt` pins the direct dependencies: `numpy`, `xarray`, `zarr`,
-`dask[distributed]`, `pandas`, `netCDF4`, `cftime`, `pytest`. Do not add anything else without
-a clear reason. The image is `python:3.12-slim` with the code in `/opt/qc` (see `Dockerfile`).
+`dask[distributed]`, `pandas`, `netCDF4`, `cftime`, `pytest`, `scipy`. Do not add anything else
+without a clear reason. `scipy` (added 2026-09-14) is `check_spatial_roughness`'s
+`ndimage.uniform_filter` -- see §6 for why it replaced xarray's dask-backed `.rolling()`. The
+image is `python:3.12-slim` with the code in `/opt/qc` (see `Dockerfile`).
 
 ```bash
 docker build -t setx-qc:latest .
@@ -311,9 +387,19 @@ container.
 ## 11. Decisions (answered by the user)
 
 1. Check 2 compares against the **mode**, and counts must match exactly.
-2. The physical limits in §4 are good for now.
+2. The physical limits in §4 are good for now. **Superseded 2026-09-14**: `tas`/`tasmax`/
+   `tasmin` are now derived from the real sample store's extremes (see §4) rather than a
+   global placeholder; the other 6 variables are still placeholders pending their own samples.
 3. Check 4's "poor correlation with both neighbours" reading and the MAD outlier rule are
-   confirmed.
+   confirmed. **Superseded 2026-09-14**: the correlation check was dropped -- confirmed against
+   a real seam artifact in the sample store that it never flagged, since a smooth defect on
+   both sides doesn't move whole-field correlation enough. Replaced with three per-day checks:
+   `check_spatial_banding`, `check_spatial_roughness`, `check_repeated_extreme` (see Check 4).
 4. `results/` is committed to git.
 5. The cross-variable `tasmin <= tas <= tasmax` check is part of the physical range test, for
    temperature only.
+6. (2026-09-14) The repeated-sentinel-value check uses the daily spatial **min/max**, not
+   mean, despite mean being the first idea raised -- verified against the real store that mean
+   only catches 4/37 known cases (the corrupted patch is too small a fraction of the domain to
+   move the mean enough to reproduce exactly), while min/max reproduce the sentinel value
+   directly. See `check_repeated_extreme` and the `PHYSICAL_LIMITS` comment in `checks.py`.

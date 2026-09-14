@@ -13,7 +13,13 @@ import xarray as xr
 from qc import checks
 from qc.catalog import MODELS, SCENARIOS, VARIABLES, store_path
 
-CHECKS = [checks.check_missing_data, checks.check_physical_range, checks.check_spatial_pattern]
+CHECKS = [
+    checks.check_missing_data,
+    checks.check_physical_range,
+    checks.check_spatial_banding,
+    checks.check_spatial_roughness,
+    checks.check_repeated_extreme,
+]
 
 
 def open_store(path, variable):
@@ -63,7 +69,9 @@ def temperature_order(root, model, scenario, tas):
 
 def write_summary(out):
     rows = [json.loads(p.read_text()) for p in sorted((out / "stores").glob("*.json"))]
-    df = pd.DataFrame(rows).drop(columns=["spatial_flagged_dates"], errors="ignore")  # lists stay in the JSON
+    df = pd.DataFrame(rows)
+    list_cols = [c for c in df.columns if c.endswith("_dates")]  # lists stay in the JSON only
+    df = df.drop(columns=list_cols)
     df.to_csv(out / "summary.csv", index=False)
 
 
