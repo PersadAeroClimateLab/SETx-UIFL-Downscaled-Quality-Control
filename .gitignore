@@ -2,6 +2,7 @@
 __pycache__/
 *.py[codz]
 *$py.class
+*.json
 
 # C extensions
 *.so
@@ -216,3 +217,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local QC run scratch space (not committed; results/ is committed separately)
+.qc-work/
