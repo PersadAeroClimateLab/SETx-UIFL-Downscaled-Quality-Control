@@ -210,7 +210,7 @@ def check_name(da: xr.DataArray, variable: str) -> dict:
   `test_checks.py` only proves a fault gets *flagged*, not that the underlying number is
   right.
 
-## 5. Outputs (committed to git)
+## 5. Outputs (attached to GitHub releases, not committed to git)
 
 ```
 results/
@@ -225,12 +225,12 @@ results/
   restart, stores that already have a JSON are skipped. Use `--overwrite` to redo them. A
   crash at store 300 does not force a re-read of 20 TB.
 - `summary.csv` is rebuilt from all the JSONs at the end of every run.
-- Size estimate: 5 time series per store now instead of 2 (`nan_count` plus 4 from check 4, all
-  float32 except `nan_count`). Measured on the real `tas` sample store: ~560 KB per store, so
-  roughly 250 MB across all real (non-`missing`) stores if most of the catalog turns out to
-  exist -- similar order to the ~100 MB estimate under the old check 4. If that's too big for
-  git once the real catalog size is known, drop the two `*_score` series to a coarser dtype or
-  keep only the scalar `*_n_flagged` counts in the `.nc`.
+- Size estimate: 5 time series per store (`nan_count` plus 4 from check 4, all float32 except
+  `nan_count`). Measured on the real `tas` sample store: ~560 KB per store, so roughly 250 MB
+  across all real (non-`missing`) stores if most of the catalog turns out to exist.
+- `results/` is not committed to git. With the real catalog landing around ~200 MB total, it's
+  attached as assets on the corresponding GitHub release instead. Do not `git add` anything
+  under `results/`; the top-level README documents this for users under its "Outputs" quote.
 
 ## 6. Performance rules
 
@@ -387,19 +387,21 @@ container.
 ## 11. Decisions (answered by the user)
 
 1. Check 2 compares against the **mode**, and counts must match exactly.
-2. The physical limits in §4 are good for now. **Superseded 2026-09-14**: `tas`/`tasmax`/
-   `tasmin` are now derived from the real sample store's extremes (see §4) rather than a
-   global placeholder; the other 6 variables are still placeholders pending their own samples.
-3. Check 4's "poor correlation with both neighbours" reading and the MAD outlier rule are
-   confirmed. **Superseded 2026-09-14**: the correlation check was dropped -- confirmed against
-   a real seam artifact in the sample store that it never flagged, since a smooth defect on
-   both sides doesn't move whole-field correlation enough. Replaced with three per-day checks:
-   `check_spatial_banding`, `check_spatial_roughness`, `check_repeated_extreme` (see Check 4).
-4. `results/` is committed to git.
+2. `tas`/`tasmax`/`tasmin` physical limits are derived from the real sample store's extremes
+   (see §4), not a global placeholder; the other 6 variables are still placeholders pending
+   their own samples.
+3. Check 4 uses three per-day checks -- `check_spatial_banding`, `check_spatial_roughness`,
+   `check_repeated_extreme` -- instead of comparing each day's spatial pattern to its
+   neighbours by correlation. Correlation missed a real seam artifact in the sample store: a
+   smooth defect on both sides of the seam doesn't move whole-field correlation enough to cross
+   its threshold (see Check 4).
+4. `results/` (the per-store JSONs/NetCDFs and `summary.csv`) is not committed to git. The real
+   catalog's outputs land around ~200 MB total, so it's attached as assets on the corresponding
+   GitHub release instead (see §5).
 5. The cross-variable `tasmin <= tas <= tasmax` check is part of the physical range test, for
    temperature only.
-6. (2026-09-14) The repeated-sentinel-value check uses the daily spatial **min/max**, not
-   mean, despite mean being the first idea raised -- verified against the real store that mean
-   only catches 4/37 known cases (the corrupted patch is too small a fraction of the domain to
-   move the mean enough to reproduce exactly), while min/max reproduce the sentinel value
-   directly. See `check_repeated_extreme` and the `PHYSICAL_LIMITS` comment in `checks.py`.
+6. The repeated-sentinel-value check uses the daily spatial **min/max**, not mean -- verified
+   against the real store that mean only catches 4/37 known cases (the corrupted patch is too
+   small a fraction of the domain to move the mean enough to reproduce exactly), while min/max
+   reproduce the sentinel value directly. See `check_repeated_extreme` and the
+   `PHYSICAL_LIMITS` comment in `checks.py`.
